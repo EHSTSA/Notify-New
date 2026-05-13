@@ -1,413 +1,416 @@
-import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/12.10.0/firebase-auth.js";
+/**
+ * stats.js  —  Audio Detector enhanced stats dashboard
+ *
+ * Drop-in replacement. Assumes the same Firebase setup as the rest of the
+ * project (auth + Firestore collection "detections/{uid}/events" where each
+ * doc has: { label: string, confidence: number, timestamp: Firestore Timestamp })
+ *
+ * If your collection path or field names differ, update COLLECTION_PATH and
+ * the field constants at the top of this file.
+ */
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import {
-  Timestamp,
-  collection,
-  getDocs,
-  orderBy,
-  query,
-  where,
-} from "https://www.gstatic.com/firebasejs/12.10.0/firebase-firestore.js";
-import { auth, db } from "./firebase.js";
+  getAuth, onAuthStateChanged, signOut
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import {
+  getFirestore, collection, query, where, orderBy, getDocs, Timestamp
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
-const userEmailEl = document.getElementById("userEmail");
-const signOutBtn = document.getElementById("signOutBtn");
-const darkSetting = document.getElementById("darkSetting");
-const filterButtons = [...document.querySelectorAll(".filter-btn")];
-const loadingState = document.getElementById("loadingState");
-const emptyState = document.getElementById("emptyState");
-const statsContent = document.getElementById("statsContent");
-const summaryTableBody = document.getElementById("summaryTableBody");
-const barCanvas = document.getElementById("barChart");
-const scatterCanvas = document.getElementById("scatterChart");
+// ── Import your shared Firebase config ──────────────────────────────────────
+// This keeps the same config object used in firebase.js / app.js.
+import { firebaseConfig } from "./firebase.js";
 
-let selectedDays = 7;
-let barChart = null;
-let scatterChart = null;
-let latestRows = [];
+// ── Firestore field names — update if yours differ ──────────────────────────
+const FIELD_LABEL      = "label";
+const FIELD_CONFIDENCE = "confidence";
+const FIELD_TIMESTAMP  = "timestamp";   // Firestore Timestamp field
 
-const theme = localStorage.getItem("audio-detector-theme") || "light";
-document.body.classList.toggle("dark", theme === "dark");
+// Path: detections/{uid}/events
+const EVENTS_SUBCOLLECTION = "events";
+const DETECTIONS_ROOT      = "detections";
 
-if (darkSetting) {
-  darkSetting.checked = theme === "dark";
+// ── Colour palette per sound label ──────────────────────────────────────────
+const SOUND_COLORS = [
+  "#4f9cf9", "#f97b4f", "#4ff9b6", "#f9d44f",
+  "#c97bf9", "#f94f7b", "#7bf94f", "#4fc5f9",
+];
 
-  darkSetting.addEventListener("change", () => {
-    const isDark = darkSetting.checked;
-    document.body.classList.toggle("dark", isDark);
-    localStorage.setItem("audio-detector-theme", isDark ? "dark" : "light");
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
 
-    if (!statsContent.hidden && latestRows.length > 0) {
-      renderCharts(latestRows);
-    }
-  });
-}
+let allDetections = [];   // raw array for the active period
+let activeDays    = 7;
+let chartInstances = {};  // track Chart.js instances for cleanup
 
-if (signOutBtn) {
-  signOutBtn.addEventListener("click", async () => {
-    await signOut(auth);
-    window.location.href = "index.html";
-  });
-}
+// DOM refs
+const loadingEl  = document.getElementById("loadingState");
+const emptyEl    = document.getElementById("emptyState");
+const contentEl  = document.getElementById("statsContent");
+const emailEl    = document.getElementById("userEmail");
 
-filterButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    const days = Number(button.dataset.days);
-    if (days === selectedDays) return;
+// ── Auth gate ─────────────────────────────────────────────────────────────────
+onAuthStateChanged(auth, user => {
+  if (!user) { window.location.href = "index.html"; return; }
+  emailEl.textContent = user.email;
+  document.getElementById("signOutBtn").onclick = () => signOut(auth);
+  loadData(user.uid, activeDays);
+});
 
-    selectedDays = days;
-    filterButtons.forEach((btn) => btn.classList.toggle("active", btn === button));
-
-    if (auth.currentUser) {
-      loadStats(auth.currentUser.uid);
-    }
+// ── Period filter buttons ────────────────────────────────────────────────────
+document.querySelectorAll(".filter-btn[data-days]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".filter-btn[data-days]").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    activeDays = parseInt(btn.dataset.days, 10);
+    const uid = auth.currentUser?.uid;
+    if (uid) loadData(uid, activeDays);
   });
 });
 
-onAuthStateChanged(auth, (user) => {
-  if (!user) {
-    window.location.href = "index.html";
-    return;
-  }
-
-  if (userEmailEl) {
-    userEmailEl.textContent = user.email || "Signed in";
-  }
-
-  loadStats(user.uid);
+// ── CSV export ───────────────────────────────────────────────────────────────
+document.getElementById("exportCsvBtn").addEventListener("click", () => {
+  if (!allDetections.length) return;
+  const header = ["timestamp", "label", "confidence"];
+  const rows = allDetections.map(d => [
+    new Date(d.ts).toISOString(),
+    `"${d.label}"`,
+    d.confidence.toFixed(4),
+  ]);
+  const csv = [header, ...rows].map(r => r.join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url  = URL.createObjectURL(blob);
+  const a    = Object.assign(document.createElement("a"), {
+    href: url, download: `detections_${activeDays}d.csv`
+  });
+  a.click();
+  URL.revokeObjectURL(url);
 });
 
-async function loadStats(userId) {
-  setState("loading");
+// ── Data loading ──────────────────────────────────────────────────────────────
+async function loadData(uid, days) {
+  showState("loading");
+  destroyCharts();
 
-  const cutoffDate = new Date(Date.now() - selectedDays * 24 * 60 * 60 * 1000);
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+  const sinceTs = Timestamp.fromDate(since);
 
   try {
-    const eventsQuery = query(
-      collection(db, "sound_events"),
-      where("userId", "==", userId),
-      where("detectedAt", ">=", Timestamp.fromDate(cutoffDate)),
-      orderBy("detectedAt", "desc")
+    const ref = collection(db, DETECTIONS_ROOT, uid, EVENTS_SUBCOLLECTION);
+    const q   = query(ref,
+      where(FIELD_TIMESTAMP, ">=", sinceTs),
+      orderBy(FIELD_TIMESTAMP, "asc")
     );
+    const snap = await getDocs(q);
 
-    const snapshot = await getDocs(eventsQuery);
-
-    const rows = snapshot.docs
-      .map((doc) => {
-        const data = doc.data();
-        const detectedAt = data.detectedAt?.toDate?.();
-
-        if (!detectedAt || Number.isNaN(detectedAt.getTime())) {
-          return null;
-        }
-
-        return {
-          id: doc.id,
-          soundLabel: String(data.soundLabel || "Unknown"),
-          confidence: clamp(Number(data.confidence ?? 0), 0, 1),
-          detectedAt,
-        };
-      })
-      .filter(Boolean);
-
-    latestRows = rows;
-    window.__statsRows = rows;
-
-    if (rows.length === 0) {
-      destroyCharts();
-      summaryTableBody.innerHTML = "";
-      setState("empty");
-      return;
-    }
-
-    renderCharts(rows);
-    renderSummaryTable(rows);
-    setState("content");
-  } catch (error) {
-    console.error("Failed to load stats:", error);
-    latestRows = [];
-    destroyCharts();
-    summaryTableBody.innerHTML = `
-      <tr>
-        <td colspan="4">Failed to load stats: ${escapeHtml(error.message || "Unknown error")}</td>
-      </tr>
-    `;
-    setState("content");
-  }
-}
-
-function setState(state) {
-  loadingState.hidden = state !== "loading";
-  emptyState.hidden = state !== "empty";
-  statsContent.hidden = state !== "content";
-}
-
-function renderCharts(rows) {
-  if (typeof Chart === "undefined") {
-    console.error("Chart.js is not loaded.");
-    summaryTableBody.innerHTML = `
-      <tr>
-        <td colspan="4">Chart.js failed to load, so the charts cannot be displayed.</td>
-      </tr>
-    `;
-    return;
-  }
-
-  const summary = buildSummary(rows);
-  renderBarChart(summary);
-  renderScatterChart(rows, summary.labels);
-}
-
-function buildSummary(rows) {
-  const map = new Map();
-
-  for (const row of rows) {
-    const existing = map.get(row.soundLabel) || {
-      soundLabel: row.soundLabel,
-      count: 0,
-      lastDetected: row.detectedAt,
-      confidenceSum: 0,
-    };
-
-    existing.count += 1;
-    existing.confidenceSum += row.confidence;
-
-    if (row.detectedAt > existing.lastDetected) {
-      existing.lastDetected = row.detectedAt;
-    }
-
-    map.set(row.soundLabel, existing);
-  }
-
-  const items = [...map.values()].sort(
-    (a, b) => b.count - a.count || a.soundLabel.localeCompare(b.soundLabel)
-  );
-
-  return {
-    items,
-    labels: items.map((item) => item.soundLabel),
-  };
-}
-
-function renderBarChart(summary) {
-  if (!barCanvas) return;
-
-  if (barChart) {
-    barChart.destroy();
-    barChart = null;
-  }
-
-  barChart = new Chart(barCanvas, {
-    type: "bar",
-    data: {
-      labels: summary.items.map((item) => item.soundLabel),
-      datasets: [
-        {
-          label: "Detections",
-          data: summary.items.map((item) => item.count),
-          borderWidth: 1,
-          borderRadius: 8,
-        },
-      ],
-    },
-    options: chartOptions({
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          callbacks: {
-            label(context) {
-              return `Detections: ${context.raw}`;
-            },
-          },
-        },
-      },
-      scales: {
-        x: {
-          ticks: {
-            maxRotation: 0,
-            minRotation: 0,
-            autoSkip: false,
-          },
-          title: {
-            display: true,
-            text: "Sound label",
-          },
-        },
-        y: {
-          beginAtZero: true,
-          ticks: {
-            precision: 0,
-          },
-          title: {
-            display: true,
-            text: "Detection count",
-          },
-        },
-      },
-    }),
-  });
-}
-
-function renderScatterChart(rows, labels) {
-  if (!scatterCanvas) return;
-
-  if (scatterChart) {
-    scatterChart.destroy();
-    scatterChart = null;
-  }
-
-  const labelIndex = new Map(labels.map((label, index) => [label, index]));
-
-  const points = rows
-    .map((row) => {
-      const yIndex = labelIndex.get(row.soundLabel);
-      if (yIndex == null) return null;
-
+    allDetections = snap.docs.map(doc => {
+      const d = doc.data();
       return {
-        x: row.detectedAt.getHours() + row.detectedAt.getMinutes() / 60,
-        y: yIndex,
-        r: 4 + row.confidence * 12,
-        soundLabel: row.soundLabel,
-        confidence: row.confidence,
-        detectedAt: row.detectedAt,
+        label:      d[FIELD_LABEL]      ?? "Unknown",
+        confidence: d[FIELD_CONFIDENCE] ?? 0,
+        ts:         d[FIELD_TIMESTAMP].toDate().getTime(),
       };
-    })
-    .filter(Boolean);
+    });
 
-  scatterChart = new Chart(scatterCanvas, {
-    type: "bubble",
-    data: {
-      datasets: [
-        {
-          label: "Detections",
-          data: points,
-        },
-      ],
-    },
-    options: chartOptions({
-      parsing: false,
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          callbacks: {
-            label(context) {
-              const point = context.raw;
-              return `${point.soundLabel} • ${point.detectedAt.toLocaleString()} • confidence ${point.confidence.toFixed(3)}`;
-            },
-          },
-        },
-      },
-      scales: {
-        x: {
-          min: 0,
-          max: 24,
-          ticks: {
-            stepSize: 1,
-            callback: (value) => `${Math.floor(value)}:00`,
-          },
-          title: {
-            display: true,
-            text: "Hour of day",
-          },
-        },
-        y: {
-          min: -0.5,
-          max: Math.max(labels.length - 0.5, 0.5),
-          ticks: {
-            stepSize: 1,
-            callback: (value) => {
-              const index = Math.round(value);
-              return labels[index] || "";
-            },
-          },
-          title: {
-            display: true,
-            text: "Sound label",
-          },
-        },
-      },
-    }),
+    if (!allDetections.length) { showState("empty"); return; }
+
+    showState("content");
+    renderDashboard(allDetections, days);
+  } catch (err) {
+    console.error("Failed to load detections:", err);
+    showState("empty");
+  }
+}
+
+// ── Master render ─────────────────────────────────────────────────────────────
+function renderDashboard(data, days) {
+  const labels     = uniqueLabels(data);
+  const colorMap   = buildColorMap(labels);
+
+  renderKPIs(data, days);
+  renderTimeline(data, labels, colorMap, days);
+  renderDonut(data, labels, colorMap);
+  renderScatter(data, labels, colorMap);
+  renderHeatmap(data);
+  renderTable(data, labels, colorMap);
+}
+
+// ── KPI strip ─────────────────────────────────────────────────────────────────
+function renderKPIs(data, days) {
+  const total  = data.length;
+  const avgConf = (data.reduce((s, d) => s + d.confidence, 0) / total * 100).toFixed(1);
+
+  // busiest hour
+  const hourCounts = Array(24).fill(0);
+  data.forEach(d => hourCounts[new Date(d.ts).getHours()]++);
+  const peakHour = hourCounts.indexOf(Math.max(...hourCounts));
+
+  // most frequent label
+  const labelCounts = {};
+  data.forEach(d => labelCounts[d.label] = (labelCounts[d.label] ?? 0) + 1);
+  const topLabel = Object.entries(labelCounts).sort((a,b)=>b[1]-a[1])[0]?.[0] ?? "—";
+
+  const strip = document.getElementById("kpiStrip");
+  strip.innerHTML = "";
+  const kpis = [
+    { value: total,          label: `Detections (${days}d)`,   accent: "#4f9cf9" },
+    { value: avgConf + "%",  label: "Avg confidence",          accent: "#4ff9b6" },
+    { value: fmtHour(peakHour), label: "Peak hour",            accent: "#f9d44f" },
+    { value: topLabel,       label: "Top sound",               accent: "#f97b4f" },
+  ];
+  kpis.forEach(k => {
+    const el = document.createElement("div");
+    el.className = "kpi";
+    el.style.setProperty("--accent-color", k.accent);
+    el.innerHTML = `<div class="kpi-value">${k.value}</div><div class="kpi-label">${k.label}</div>`;
+    strip.appendChild(el);
   });
 }
 
-function renderSummaryTable(rows) {
-  const summary = buildSummary(rows);
+// ── Timeline chart ────────────────────────────────────────────────────────────
+function renderTimeline(data, labels, colorMap, days) {
+  // Bucket by day
+  const buckets = {};
+  data.forEach(d => {
+    const day = dayKey(d.ts);
+    if (!buckets[day]) buckets[day] = {};
+    buckets[day][d.label] = (buckets[day][d.label] ?? 0) + 1;
+  });
 
-  summaryTableBody.innerHTML = summary.items
-    .map((item) => {
-      const avgConfidence = item.confidenceSum / item.count;
+  const dayKeys = sortedKeys(buckets);
+  const datasets = labels.map(lbl => ({
+    label: lbl,
+    data:  dayKeys.map(k => buckets[k]?.[lbl] ?? 0),
+    backgroundColor: hex2rgba(colorMap[lbl], 0.7),
+    borderColor:     colorMap[lbl],
+    borderWidth: 1,
+    borderRadius: 3,
+  }));
 
-      return `
-        <tr>
-          <td>${escapeHtml(item.soundLabel)}</td>
-          <td>${item.count}</td>
-          <td>${escapeHtml(item.lastDetected.toLocaleString())}</td>
-          <td>${avgConfidence.toFixed(3)}</td>
-        </tr>
-      `;
-    })
-    .join("");
+  chartInstances.timeline = new Chart(
+    document.getElementById("timelineChart"),
+    {
+      type: "bar",
+      data: { labels: dayKeys, datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { labels: { color: "#6b7280", font: { family: "DM Mono", size: 11 }, boxWidth: 10 } } },
+        scales: {
+          x: { stacked: true, ticks: { color: "#6b7280", font: { family: "DM Mono", size: 10 } }, grid: { color: "#252933" } },
+          y: { stacked: true, ticks: { color: "#6b7280", font: { family: "DM Mono", size: 10 }, stepSize: 1 }, grid: { color: "#252933" } },
+        }
+      }
+    }
+  );
 }
 
-function chartOptions(extra = {}) {
-  const isDark = document.body.classList.contains("dark");
-  const tickColor = isDark ? "#cbd5e1" : "#475569";
-  const gridColor = isDark ? "rgba(148, 163, 184, 0.15)" : "rgba(15, 23, 42, 0.08)";
+// ── Donut chart ───────────────────────────────────────────────────────────────
+function renderDonut(data, labels, colorMap) {
+  const counts = {};
+  data.forEach(d => counts[d.label] = (counts[d.label] ?? 0) + 1);
 
-  const mergedScales = {};
-  const inputScales = extra.scales || {};
-
-  for (const [key, config] of Object.entries(inputScales)) {
-    mergedScales[key] = {
-      grid: { color: gridColor },
-      ticks: { color: tickColor, ...(config.ticks || {}) },
-      title: { color: tickColor, ...(config.title || {}) },
-      ...config,
-    };
-  }
-
-  return {
-    responsive: true,
-    maintainAspectRatio: false,
-    animation: false,
-    scales: mergedScales,
-    plugins: {
-      legend: {
-        labels: { color: tickColor },
+  chartInstances.donut = new Chart(
+    document.getElementById("donutChart"),
+    {
+      type: "doughnut",
+      data: {
+        labels,
+        datasets: [{ data: labels.map(l => counts[l] ?? 0), backgroundColor: labels.map(l => colorMap[l]), borderWidth: 0, hoverOffset: 8 }]
       },
-      ...(extra.plugins || {}),
-    },
-    elements: {
-      point: {
-        hoverRadius: 10,
-      },
-      ...(extra.elements || {}),
-    },
-    ...extra,
-    scales: mergedScales,
-  };
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        cutout: "65%",
+        plugins: {
+          legend: { position: "right", labels: { color: "#6b7280", font: { family: "DM Mono", size: 11 }, boxWidth: 10, padding: 14 } }
+        }
+      }
+    }
+  );
+}
+
+// ── Scatter chart ─────────────────────────────────────────────────────────────
+function renderScatter(data, labels, colorMap) {
+  const datasets = labels.map(lbl => ({
+    label: lbl,
+    data: data.filter(d => d.label === lbl).map(d => ({ x: d.ts, y: +(d.confidence * 100).toFixed(1) })),
+    backgroundColor: hex2rgba(colorMap[lbl], 0.6),
+    pointRadius: 4,
+    pointHoverRadius: 6,
+  }));
+
+  chartInstances.scatter = new Chart(
+    document.getElementById("scatterChart"),
+    {
+      type: "scatter",
+      data: { datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { labels: { color: "#6b7280", font: { family: "DM Mono", size: 11 }, boxWidth: 10 } } },
+        scales: {
+          x: {
+            type: "time",
+            time: { tooltipFormat: "MMM d, h:mm a" },
+            ticks: { color: "#6b7280", font: { family: "DM Mono", size: 10 } },
+            grid: { color: "#252933" }
+          },
+          y: {
+            min: 0, max: 100,
+            title: { display: true, text: "Confidence %", color: "#6b7280", font: { family: "DM Mono", size: 10 } },
+            ticks: { color: "#6b7280", font: { family: "DM Mono", size: 10 }, callback: v => v + "%" },
+            grid: { color: "#252933" }
+          }
+        }
+      }
+    }
+  );
+}
+
+// ── Heatmap ───────────────────────────────────────────────────────────────────
+function renderHeatmap(data) {
+  const DAYS  = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const HOURS = Array.from({ length: 24 }, (_, i) => i);
+
+  // count[dow][hour]
+  const count = Array.from({ length: 7 }, () => Array(24).fill(0));
+  data.forEach(d => {
+    const dt = new Date(d.ts);
+    count[dt.getDay()][dt.getHours()]++;
+  });
+  const maxVal = Math.max(1, ...count.flat());
+
+  const container = document.getElementById("heatmapContainer");
+  container.innerHTML = "";
+
+  // Hour labels row
+  const labelRow = document.createElement("div");
+  labelRow.className = "heatmap-hour-labels";
+  labelRow.innerHTML = `<div></div>` + HOURS.map(h =>
+    `<div class="heatmap-hour-label">${h === 0 ? "12a" : h < 12 ? h + "a" : h === 12 ? "12p" : (h-12) + "p"}</div>`
+  ).join("");
+  container.appendChild(labelRow);
+
+  // Grid rows
+  const grid = document.createElement("div");
+  grid.className = "heatmap-grid";
+
+  DAYS.forEach((day, dow) => {
+    const dayLabel = document.createElement("div");
+    dayLabel.className = "heatmap-day-label";
+    dayLabel.textContent = day;
+    grid.appendChild(dayLabel);
+
+    HOURS.forEach(h => {
+      const cell = document.createElement("div");
+      cell.className = "heatmap-cell";
+      const val = count[dow][h];
+      const intensity = val / maxVal;
+      // Interpolate from surface colour → accent
+      cell.style.background = val > 0
+        ? `rgba(79, 156, 249, ${0.12 + intensity * 0.88})`
+        : "var(--stats-border)";
+      cell.title = `${day} ${fmtHour(h)}: ${val} detection${val !== 1 ? "s" : ""}`;
+      cell.dataset.tip = `${day} ${fmtHour(h)}: ${val}`;
+      grid.appendChild(cell);
+    });
+  });
+
+  container.appendChild(grid);
+}
+
+// ── Summary table ─────────────────────────────────────────────────────────────
+function renderTable(data, labels, colorMap) {
+  const tbody = document.getElementById("summaryTableBody");
+  tbody.innerHTML = "";
+
+  labels.forEach(lbl => {
+    const rows = data.filter(d => d.label === lbl);
+    if (!rows.length) return;
+
+    const count   = rows.length;
+    const avgConf = rows.reduce((s, d) => s + d.confidence, 0) / count;
+    const lastTs  = Math.max(...rows.map(d => d.ts));
+
+    // peak hour
+    const hc = Array(24).fill(0);
+    rows.forEach(d => hc[new Date(d.ts).getHours()]++);
+    const peakH = hc.indexOf(Math.max(...hc));
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>
+        <div class="sound-pill">
+          <span class="sound-dot" style="background:${colorMap[lbl]}"></span>
+          ${lbl}
+        </div>
+      </td>
+      <td>${count}</td>
+      <td>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar"><div class="conf-bar-fill" style="width:${(avgConf*100).toFixed(0)}%;background:${colorMap[lbl]}"></div></div>
+          <span>${(avgConf*100).toFixed(1)}%</span>
+        </div>
+      </td>
+      <td>${fmtHour(peakH)}</td>
+      <td>${fmtRelTime(lastTs)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function showState(state) {
+  loadingEl.hidden  = state !== "loading";
+  emptyEl.hidden    = state !== "empty";
+  contentEl.hidden  = state !== "content";
 }
 
 function destroyCharts() {
-  if (barChart) {
-    barChart.destroy();
-    barChart = null;
-  }
-
-  if (scatterChart) {
-    scatterChart.destroy();
-    scatterChart = null;
-  }
+  Object.values(chartInstances).forEach(c => { try { c.destroy(); } catch {} });
+  chartInstances = {};
 }
 
-function clamp(value, min, max) {
-  return Math.min(max, Math.max(min, value));
+function uniqueLabels(data) {
+  return [...new Set(data.map(d => d.label))];
 }
 
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
+function buildColorMap(labels) {
+  const map = {};
+  labels.forEach((lbl, i) => map[lbl] = SOUND_COLORS[i % SOUND_COLORS.length]);
+  return map;
+}
+
+function dayKey(ts) {
+  const d = new Date(ts);
+  return `${d.getMonth()+1}/${d.getDate()}`;
+}
+
+function sortedKeys(obj) {
+  return Object.keys(obj).sort();
+}
+
+function hex2rgba(hex, alpha) {
+  const r = parseInt(hex.slice(1,3), 16);
+  const g = parseInt(hex.slice(3,5), 16);
+  const b = parseInt(hex.slice(5,7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function fmtHour(h) {
+  if (h === 0)  return "12 AM";
+  if (h < 12)   return `${h} AM`;
+  if (h === 12) return "12 PM";
+  return `${h - 12} PM`;
+}
+
+function fmtRelTime(ts) {
+  const diff = Date.now() - ts;
+  const mins  = Math.floor(diff / 60000);
+  if (mins < 1)  return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24)  return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
 }
