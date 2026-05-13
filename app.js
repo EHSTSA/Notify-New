@@ -110,51 +110,82 @@ onAuthStateChanged(auth, user => {
 });
 
 // ── Sound definitions ─────────────────────────────────────────────────────────
-// YAMNet outputs 521 classes. Each sound maps one or more class indices so
-// that any related class can trigger the alert. We take MAX across all indices.
-// Full class list:
-// https://github.com/tensorflow/models/blob/master/research/audioset/yamnet/yamnet_class_map.csv
+// Each sound has:
+//   tmIdx   — index in YOUR Teachable Machine model's softmax output
+//             (0=Baby Crying, 1=Background Noise, 2=Car Horn, 3=Dog Barking,
+//              4=Doorbell, 5=Fire Alarm, 6=Glass Breaking)
+//   yamIdx  — YAMNet class indices that correspond to the same sound
+//             (MAX across all indices is used as the YAMNet score)
+//
+// Alert logic (accuracy-first):
+//   DANGER sounds  → alert if TM score alone is high (≥ tmDangerThreshold)
+//                    OR if BOTH TM ≥ tmThreshold AND YAMNet ≥ yamThreshold
+//                    (danger sounds must never be missed)
+//   WARN/INFO sounds → alert only when BOTH models agree (ensemble voting)
+//                      This eliminates almost all false positives.
+
 const SOUNDS = [
   {
     id: "firealarm", tier: "danger", emoji: "🚨", label: "Fire Alarm",
     notif: "Fire alarm detected — check your surroundings!",
-    idx: [388, 389, 390, 393, 394, 396, 397, 398],
+    tmIdx:  5,
+    yamIdx: [388, 389, 390, 393, 396, 397],
     // 388=Smoke detector, 389=Fire alarm, 390=Alarm, 393=Buzzer,
-    // 394=Alarm clock, 396=Siren, 397=Civil defense siren, 398=Whistle
+    // 396=Siren, 397=Civil defense siren
   },
   {
     id: "glass", tier: "danger", emoji: "💥", label: "Glass Breaking",
     notif: "Glass breaking detected!",
-    idx: [60, 61],
+    tmIdx:  6,
+    yamIdx: [60, 61],
     // 60=Glass, 61=Shatter
   },
   {
     id: "baby", tier: "warn", emoji: "👶", label: "Baby Crying",
     notif: "Baby crying detected.",
-    idx: [14, 15],
-    // 14=Crying, sobbing, 15=Baby cry, infant cry
+    tmIdx:  0,
+    yamIdx: [14, 15],
+    // 14=Crying/sobbing, 15=Baby cry/infant cry
   },
   {
     id: "carhorn", tier: "warn", emoji: "📯", label: "Car Horn",
     notif: "Car horn detected nearby.",
-    idx: [325, 326, 327],
-    // 325=Car horn, honking, 326=Toot, 327=Truck horn
+    tmIdx:  2,
+    yamIdx: [325, 326, 327],
+    // 325=Car horn/honking, 326=Toot, 327=Truck horn
   },
   {
     id: "doorbell", tier: "info", emoji: "🔔", label: "Doorbell",
     notif: "Someone rang the doorbell.",
-    idx: [379, 380],
+    tmIdx:  4,
+    yamIdx: [379, 380],
     // 379=Doorbell, 380=Ding-dong
   },
   {
     id: "dog", tier: "info", emoji: "🐕", label: "Dog Barking",
     notif: "Dog barking detected.",
-    idx: [74, 75, 76, 77],
+    tmIdx:  3,
+    yamIdx: [74, 75, 76, 77],
     // 74=Dog, 75=Bark, 76=Yip, 77=Howl
   },
 ];
 
+// TM model background noise class — if TM thinks it's this, skip inference
+const TM_BACKGROUND_IDX = 1;
+
 const enabled = Object.fromEntries(SOUNDS.map(s => [s.id, true]));
+
+// ── Thresholds ────────────────────────────────────────────────────────────────
+// These are tuned for accuracy-first operation.
+// TM threshold: minimum TM score for a sound to be considered a candidate
+// YAM threshold: minimum YAMNet score for ensemble confirmation
+// Danger-only threshold: TM score so high we alert without YAMNet confirmation
+//   (catches fire alarms even if YAMNet is uncertain — safety critical)
+
+let TM_THRESHOLD     = 0.65;  // TM must be this confident (ensemble mode)
+let YAM_THRESHOLD    = 0.10;  // YAMNet confirmation bar (lower — it's a coarse check)
+let DANGER_TM_ONLY   = 0.90;  // TM alone triggers danger alert above this score
+let THRESHOLD        = 0.65;  // exposed to the slider UI → updates TM_THRESHOLD
 
 // ── App DOM ───────────────────────────────────────────────────────────────────
 const statusEl        = document.getElementById("status");
@@ -212,19 +243,24 @@ darkSetting.onchange = () => {
   localStorage.setItem("audio-detector-theme", darkSetting.checked ? "dark" : "light");
 };
 
+// Slider controls the TM confidence threshold (the primary gatekeeper)
+thresholdSlider.value = TM_THRESHOLD;
+thresholdVal.textContent = TM_THRESHOLD.toFixed(2);
 thresholdSlider.oninput = () => {
-  THRESHOLD = parseFloat(thresholdSlider.value);
-  thresholdVal.textContent = THRESHOLD.toFixed(2);
+  THRESHOLD = TM_THRESHOLD = parseFloat(thresholdSlider.value);
+  DANGER_TM_ONLY = Math.min(0.99, TM_THRESHOLD + 0.25);
+  thresholdVal.textContent = TM_THRESHOLD.toFixed(2);
 };
 
 let alertTO;
-function showAlert(sound, score) {
+function showAlert(sound, score, method) {
   clearTimeout(alertTO);
+  const methodTag = method === "ensemble" ? "🤝 ensemble" : "⚡ fast-path";
   alertBox.className   = `alert-${sound.tier}`;
-  alertBox.textContent = `${sound.emoji}  ${sound.label} detected (${score.toFixed(3)})`;
+  alertBox.textContent = `${sound.emoji}  ${sound.label} detected (${score.toFixed(3)} · ${methodTag})`;
   alertBox.style.display   = "block";
   alertBox.style.animation = "none";
-  void alertBox.offsetWidth; // force reflow so CSS animation restarts
+  void alertBox.offsetWidth;
   alertBox.style.animation = "";
   alertTO = setTimeout(() => { alertBox.style.display = "none"; }, 8000);
 }
@@ -237,8 +273,7 @@ async function notify(sound) {
   }
 }
 
-// FIX 2: Beep gets its own short-lived AudioContext so it never touches or
-// closes the mic AudioContext that must stay alive during listening.
+// Beep uses its own short-lived AudioContext so it never touches the mic context
 function beep(tier) {
   try {
     const bCtx = new AudioContext();
@@ -255,13 +290,14 @@ function beep(tier) {
   } catch (e) { console.error("Beep error:", e); }
 }
 
-async function saveSoundEvent(sound, score) {
+async function saveSoundEvent(sound, score, method) {
   const user = auth.currentUser;
   if (!user) return;
   try {
     await addDoc(collection(db, "sound_events"), {
       userId: user.uid, soundLabel: sound.label,
       confidence: Number(score), detectedAt: serverTimestamp(),
+      detectionMethod: method,
     });
   } catch (e) {
     console.error("Failed to save sound event:", e);
@@ -269,166 +305,300 @@ async function saveSoundEvent(sound, score) {
   }
 }
 
-// ── YAMNet inference pipeline ─────────────────────────────────────────────────
-// FIX 1: Replaced deprecated ScriptProcessor + plain Array with an AnalyserNode
-//        + fixed-size Float32Array ring buffer. No more O(n²) spread copies or
-//        GC pauses from growing arrays.
-// FIX 3: resampleTo16k() now uses a single OfflineAudioContext at YAMNET_SR,
-//        feeding it a buffer created at fromSR. The browser's sinc resampler
-//        handles the rate conversion implicitly — no double-context overhead.
-// FIX 4: YAMNet returns [scores, embeddings, log_mel_spectrogram]. We always
-//        grab index 0 safely and dispose all output tensors.
-// FIX 5: lastHit is now a per-sound map so a dog bark can't suppress a
-//        simultaneous fire alarm detection.
+// ── Model constants ───────────────────────────────────────────────────────────
+// TM model (your trained model.json / weights.bin)
+const TM_MODEL_URL   = "./model.json";
+const TM_NUM_FRAMES  = 43;
+const TM_NUM_BINS    = 232;
+const TM_FFT_SIZE    = 1024;
+const TM_FRAME_MS    = 23;   // ≈ 1024 / 44100 * 1000
+const TM_INFER_MS    = 500;  // run TM inference every 500 ms
 
-const YAMNET_SR  = 16000;   // YAMNet required input rate
-const WINDOW_S   = 1.5;     // seconds of audio per inference call
-const POLL_MS    = 500;     // inference frequency (ms)
-const CAPTURE_MS = 46;      // frame capture interval (~2048 samples @ 44.1kHz)
-const COOLDOWN   = 3000;    // ms between alerts for the same sound
-const MODEL_URL  = "https://tfhub.dev/google/tfjs-model/yamnet/tfjs/1";
+// YAMNet (Google TF Hub)
+const YAM_MODEL_URL  = "https://tfhub.dev/google/tfjs-model/yamnet/tfjs/1";
+const YAM_SR         = 16000;
+const YAM_WINDOW_S   = 1.5;
+const YAM_CAPTURE_MS = 46;   // ≈ 2048 / 44100 * 1000
+const YAM_INFER_MS   = 750;  // YAMNet runs less often (heavier model)
 
-let THRESHOLD = 0.20;
+const COOLDOWN = 3000;   // ms between alerts per sound
 
-let model         = null;
-let audioCtx      = null;
-let micStream     = null;
-let srcNode       = null;
-let analyser      = null;
-let silentGain    = null;
-let nativeSR      = 44100;
-let ringBuffer    = null;   // Float32Array — fixed-size ring buffer
-let ringHead      = 0;      // next write index
-let ringFull      = false;  // true once buffer has wrapped at least once
-let captureTimer  = null;
-let inferenceTimer = null;
-let listening     = false;
-let lastHit       = {};     // { soundId: lastAlertTimestamp }
+// ── State ─────────────────────────────────────────────────────────────────────
+let tmModel    = null;
+let yamModel   = null;
+let audioCtx   = null;
+let micStream  = null;
+let srcNode    = null;
+let nativeSR   = 44100;
 
-async function loadModel() {
-  statusEl.textContent = "Loading YAMNet…";
-  addLog("Fetching YAMNet from TF Hub (first load ~5 s on slow connections)…");
-  try {
-    model = await window.tf.loadGraphModel(MODEL_URL, { fromTFHub: true });
-    // Warm-up: one zero-input pass so the first real inference isn't slow
-    const dummy  = window.tf.zeros([YAMNET_SR]);
-    const warmOut = model.execute({ waveform: dummy });
-    (Array.isArray(warmOut) ? warmOut : [warmOut]).forEach(t => t.dispose());
-    dummy.dispose();
-    addLog("✅ YAMNet ready.");
-    statusEl.textContent = "Ready";
-  } catch (e) {
-    addLog("❌ YAMNet load failed: " + e.message);
-    statusEl.textContent = "Load failed";
-    throw e;
+// TM uses AnalyserNode at FFT_SIZE 1024 → frequencyBinCount = 512
+// We slice to first 232 bins, matching TM training exactly
+let tmAnalyser   = null;
+let tmFrameBuf   = [];     // rolling array of Float32Array[232]
+let tmFrameTimer = null;
+let tmInferTimer = null;
+
+// YAMNet uses a separate AnalyserNode for raw PCM + ring buffer
+let yamAnalyser  = null;
+let yamRing      = null;   // Float32Array ring buffer
+let yamRingHead  = 0;
+let yamRingFull  = false;
+let yamCapTimer  = null;
+let yamInferTimer = null;
+
+let silentGain = null;
+let listening  = false;
+let lastHit    = {};  // { soundId: timestamp } — per-sound cooldown
+
+// Latest scores from each model, updated independently
+let latestTmScores  = null;  // Float32Array[7]
+let latestYamScores = null;  // Float32Array[521]
+
+// ── Model loading ─────────────────────────────────────────────────────────────
+async function loadModels() {
+  statusEl.textContent = "Loading models…";
+
+  // Load both models in parallel for faster startup
+  addLog("Loading TM model and YAMNet in parallel…");
+  const [tm, yam] = await Promise.all([
+    window.tf.loadLayersModel(TM_MODEL_URL).catch(e => {
+      addLog("⚠️ TM model failed to load: " + e.message); return null;
+    }),
+    window.tf.loadGraphModel(YAM_MODEL_URL, { fromTFHub: true }).catch(e => {
+      addLog("⚠️ YAMNet failed to load: " + e.message); return null;
+    }),
+  ]);
+
+  tmModel  = tm;
+  yamModel = yam;
+
+  if (!tmModel && !yamModel) {
+    statusEl.textContent = "Both models failed to load";
+    throw new Error("No models available");
+  }
+
+  // Warm up whichever loaded
+  if (tmModel) {
+    const d = window.tf.zeros([1, TM_NUM_FRAMES, TM_NUM_BINS, 1]);
+    tmModel.predict(d).dispose(); d.dispose();
+    addLog("✅ TM model ready (7 classes).");
+  }
+  if (yamModel) {
+    const d = window.tf.zeros([YAM_SR]);
+    const out = yamModel.execute({ waveform: d });
+    (Array.isArray(out) ? out : [out]).forEach(t => t.dispose()); d.dispose();
+    addLog("✅ YAMNet ready (521 classes).");
+  }
+
+  if (tmModel && yamModel) {
+    addLog("🤝 Ensemble mode: both models must agree before alerting.");
+  } else if (tmModel) {
+    addLog("⚠️ Running TM-only mode (YAMNet unavailable).");
+  } else {
+    addLog("⚠️ Running YAMNet-only mode (TM unavailable).");
+  }
+
+  statusEl.textContent = "Ready";
+}
+
+// ── TM frame collection ───────────────────────────────────────────────────────
+// Captures frequency-domain data (dB) exactly as TM does during training.
+function collectTmFrame() {
+  if (!tmAnalyser) return;
+  const freqData = new Float32Array(tmAnalyser.frequencyBinCount); // 512 bins
+  tmAnalyser.getFloatFrequencyData(freqData);
+  tmFrameBuf.push(freqData.slice(0, TM_NUM_BINS));  // keep first 232 bins
+  // Keep a rolling window — only need the last TM_NUM_FRAMES frames
+  if (tmFrameBuf.length > TM_NUM_FRAMES * 2) {
+    tmFrameBuf = tmFrameBuf.slice(-TM_NUM_FRAMES);
   }
 }
 
-// FIX 3: Single OfflineAudioContext at target rate. Browser resamples for us.
+// ── TM inference ──────────────────────────────────────────────────────────────
+async function runTmInference() {
+  if (!tmModel || !listening || tmFrameBuf.length < TM_NUM_FRAMES) return;
+
+  const frames = tmFrameBuf.slice(-TM_NUM_FRAMES);
+  const flat   = new Float32Array(TM_NUM_FRAMES * TM_NUM_BINS);
+  for (let i = 0; i < TM_NUM_FRAMES; i++) flat.set(frames[i], i * TM_NUM_BINS);
+
+  // Z-score normalization — required to match TM's training pipeline
+  let sum = 0;
+  for (let i = 0; i < flat.length; i++) sum += flat[i];
+  const mean = sum / flat.length;
+  let sqSum  = 0;
+  for (let i = 0; i < flat.length; i++) sqSum += (flat[i] - mean) ** 2;
+  const std = Math.sqrt(sqSum / flat.length) || 1;
+  for (let i = 0; i < flat.length; i++) flat[i] = (flat[i] - mean) / std;
+
+  let input, prediction;
+  try {
+    input      = window.tf.tensor4d(flat, [1, TM_NUM_FRAMES, TM_NUM_BINS, 1]);
+    prediction = tmModel.predict(input);
+    latestTmScores = (await prediction.array())[0];
+  } catch (e) {
+    addLog("⚠️ TM inference error: " + e.message); return;
+  } finally {
+    input?.dispose(); prediction?.dispose();
+  }
+
+  // Log top-3 TM scores for debugging
+  const top3 = latestTmScores.map((v, i) => [i, v])
+    .sort((a, b) => b[1] - a[1]).slice(0, 3);
+  console.log("TM top-3:", top3.map(([i, v]) => `[${i}]${v.toFixed(3)}`).join(" "));
+
+  // Attempt to fire an alert now that TM has new scores
+  evaluateEnsemble("tm");
+}
+
+// ── YAMNet frame collection ───────────────────────────────────────────────────
+// Captures raw PCM via time-domain data — what YAMNet needs after resampling.
+function collectYamFrame() {
+  if (!yamAnalyser) return;
+  const chunk = new Float32Array(yamAnalyser.fftSize); // 2048 raw PCM samples
+  yamAnalyser.getFloatTimeDomainData(chunk);
+  for (let i = 0; i < chunk.length; i++) {
+    yamRing[yamRingHead] = chunk[i];
+    yamRingHead = (yamRingHead + 1) % yamRing.length;
+    if (yamRingHead === 0) yamRingFull = true;
+  }
+}
+
+function readYamRing() {
+  if (!yamRingFull) return yamRing.slice(0, yamRingHead);
+  const out = new Float32Array(yamRing.length);
+  out.set(yamRing.subarray(yamRingHead));
+  out.set(yamRing.subarray(0, yamRingHead), yamRing.length - yamRingHead);
+  return out;
+}
+
 async function resampleTo16k(float32, fromSR) {
-  if (fromSR === YAMNET_SR) return float32;
-  const outLen = Math.ceil(float32.length * YAMNET_SR / fromSR);
-  const offCtx = new OfflineAudioContext(1, outLen, YAMNET_SR);
+  if (fromSR === YAM_SR) return float32;
+  const outLen = Math.ceil(float32.length * YAM_SR / fromSR);
+  const offCtx = new OfflineAudioContext(1, outLen, YAM_SR);
   const buf    = offCtx.createBuffer(1, float32.length, fromSR);
   buf.getChannelData(0).set(float32);
   const src = offCtx.createBufferSource();
-  src.buffer = buf;
-  src.connect(offCtx.destination);
-  src.start(0);
+  src.buffer = buf; src.connect(offCtx.destination); src.start(0);
   const rendered = await offCtx.startRendering();
   return rendered.getChannelData(0);
 }
 
-// Read the ring buffer in chronological order (oldest → newest).
-function readRing() {
-  if (!ringFull) return ringBuffer.slice(0, ringHead);
-  const out = new Float32Array(ringBuffer.length);
-  out.set(ringBuffer.subarray(ringHead));
-  out.set(ringBuffer.subarray(0, ringHead), ringBuffer.length - ringHead);
-  return out;
-}
+// ── YAMNet inference ──────────────────────────────────────────────────────────
+async function runYamInference() {
+  if (!yamModel || !listening) return;
+  const needed = Math.ceil(nativeSR * YAM_WINDOW_S);
+  if (!yamRingFull && yamRingHead < needed) return;
 
-// FIX 1: Capture via AnalyserNode.getFloatTimeDomainData — gives raw PCM
-// in [-1, 1] range, which is exactly what YAMNet wants after resampling.
-function captureFrame() {
-  if (!analyser) return;
-  const chunk = new Float32Array(analyser.fftSize); // 2048 samples
-  analyser.getFloatTimeDomainData(chunk);
-  for (let i = 0; i < chunk.length; i++) {
-    ringBuffer[ringHead] = chunk[i];
-    ringHead = (ringHead + 1) % ringBuffer.length;
-    if (ringHead === 0) ringFull = true;
-  }
-}
-
-async function runInference() {
-  if (!model || !listening) return;
-
-  const needed = Math.ceil(nativeSR * WINDOW_S);
-  if (!ringFull && ringHead < needed) return; // not enough audio yet
-
-  const all  = readRing();
+  const all  = readYamRing();
   const snap = all.length >= needed ? all.slice(all.length - needed) : all;
 
-  let wv, outTensors, scores;
+  let wv, outTensors;
   try {
     const s16     = await resampleTo16k(snap, nativeSR);
     const clamped = s16.map(v => Math.max(-1, Math.min(1, v)));
     wv = window.tf.tensor1d(clamped);
-
-    // FIX 4: always treat output as array, grab scores at index 0
-    outTensors = model.execute({ waveform: wv });
+    outTensors = yamModel.execute({ waveform: wv });
     const scoresTensor = Array.isArray(outTensors) ? outTensors[0] : outTensors;
-    const meanScores   = window.tf.mean(scoresTensor, 0); // avg over frames → [521]
-    scores = await meanScores.array();
+    const meanScores   = window.tf.mean(scoresTensor, 0);
+    latestYamScores    = await meanScores.array();
     meanScores.dispose();
   } catch (e) {
-    addLog("⚠️ Inference error: " + e.message);
-    return;
+    addLog("⚠️ YAMNet inference error: " + e.message); return;
   } finally {
     wv?.dispose();
     (Array.isArray(outTensors) ? outTensors : [outTensors]).forEach(t => t?.dispose());
   }
 
-  // Top-5 debug output — open browser DevTools console to see live scores
-  const top5 = scores
-    .map((v, i) => [i, v])
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5);
-  console.log("YAMNet top-5:", top5.map(([i, v]) => `[${i}] ${v.toFixed(3)}`).join("  "));
+  // Log top-5 YAMNet for debugging
+  const top5 = latestYamScores.map((v, i) => [i, v])
+    .sort((a, b) => b[1] - a[1]).slice(0, 5);
+  console.log("YAMNet top-5:", top5.map(([i, v]) => `[${i}]${v.toFixed(3)}`).join(" "));
 
-  const now = Date.now();
-  let best = null, bestScore = 0;
+  evaluateEnsemble("yam");
+}
+
+// ── Ensemble evaluation ───────────────────────────────────────────────────────
+// Called after either model updates its scores. Checks all enabled sounds
+// and decides whether to fire an alert based on the ensemble voting logic.
+//
+// Strategy (accuracy-first):
+//   1. If only one model is loaded, use it alone with a high threshold.
+//   2. If both models are loaded:
+//        a. DANGER sounds: alert if TM score ≥ DANGER_TM_ONLY  (safety net,
+//           skips YAMNet confirmation — we can't miss a fire alarm)
+//        b. All sounds: alert if TM ≥ TM_THRESHOLD AND YAMNet ≥ YAM_THRESHOLD
+//           (ensemble agreement — very low false positive rate)
+
+function evaluateEnsemble(trigger) {
+  if (!listening) return;
+  const now  = Date.now();
+  const both = tmModel && yamModel;
+
+  let best = null, bestScore = 0, bestMethod = "";
 
   for (const s of SOUNDS) {
     if (!enabled[s.id]) continue;
-    // FIX 5: independent cooldown per sound
     if (now - (lastHit[s.id] ?? 0) < COOLDOWN) continue;
-    const sc = Math.max(...s.idx.map(i => scores[i] ?? 0));
-    if (sc >= THRESHOLD && sc > bestScore) { best = s; bestScore = sc; }
+
+    const tmScore  = latestTmScores  ? (latestTmScores[s.tmIdx]  ?? 0) : 0;
+    const yamScore = latestYamScores
+      ? Math.max(...s.yamIdx.map(i => latestYamScores[i] ?? 0))
+      : 0;
+
+    // Skip if TM thinks this is background noise dominating the window
+    if (latestTmScores && latestTmScores[TM_BACKGROUND_IDX] > tmScore) continue;
+
+    let score  = 0;
+    let method = "";
+
+    if (!both) {
+      // Single-model fallback
+      if (tmModel  && tmScore  >= TM_THRESHOLD)  { score = tmScore;  method = "tm-only";  }
+      if (yamModel && yamScore >= 0.20)           { score = yamScore; method = "yam-only"; }
+    } else {
+      // Ensemble path
+      // 2a: Danger fast-path — TM alone if extremely confident
+      if (s.tier === "danger" && tmScore >= DANGER_TM_ONLY) {
+        score  = tmScore;
+        method = "fast-path";
+      }
+      // 2b: Full ensemble agreement
+      else if (tmScore >= TM_THRESHOLD && yamScore >= YAM_THRESHOLD) {
+        // Combined score: weighted average (TM carries more weight as it's
+        // specifically trained on these exact sound classes)
+        score  = tmScore * 0.7 + yamScore * 0.3;
+        method = "ensemble";
+      }
+    }
+
+    if (score > 0 && score > bestScore) {
+      best = s; bestScore = score; bestMethod = method;
+    }
   }
 
   if (best) {
     lastHit[best.id] = now;
-    showAlert(best, bestScore);
-    addLog(`${best.emoji} ${best.label} — score ${bestScore.toFixed(3)}`);
+    showAlert(best, bestScore, bestMethod);
+    addLog(`${best.emoji} ${best.label} — score ${bestScore.toFixed(3)} [${bestMethod}]`);
     beep(best.tier);
     notify(best);
-    await sendEmail(best, bestScore);
-    await saveSoundEvent(best, bestScore);
-    await flashScreen(3);
+    sendEmail(best, bestScore);
+    saveSoundEvent(best, bestScore, bestMethod);
+    flashScreen(3);
   }
 }
 
+// ── Start / Stop ──────────────────────────────────────────────────────────────
 async function startListening() {
-  if (!model) await loadModel();
+  if (!tmModel && !yamModel) await loadModels();
   if (listening) return;
 
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: false, // must be off — processing mangles YAMNet input
+        echoCancellation: false, // keep raw audio — processing hurts accuracy
         noiseSuppression: false,
         autoGainControl:  false,
         channelCount:     1,
@@ -437,8 +607,7 @@ async function startListening() {
     });
   } catch (e) {
     addLog("Mic error: " + e.message);
-    statusEl.textContent = "Mic denied";
-    return;
+    statusEl.textContent = "Mic denied"; return;
   }
 
   try {
@@ -447,35 +616,56 @@ async function startListening() {
     if (audioCtx.state === "suspended") await audioCtx.resume();
     nativeSR  = audioCtx.sampleRate;
 
-    srcNode  = audioCtx.createMediaStreamSource(stream);
+    srcNode = audioCtx.createMediaStreamSource(stream);
 
-    // FIX 1: AnalyserNode replaces ScriptProcessor
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize               = 2048;  // 2048 PCM samples per capture tick
-    analyser.smoothingTimeConstant = 0;     // raw, unsmoothed
+    // ── TM analyser: frequency domain, FFT 1024 ───────────────────────────
+    if (tmModel) {
+      tmAnalyser = audioCtx.createAnalyser();
+      tmAnalyser.fftSize               = TM_FFT_SIZE; // 1024 → 512 bins
+      tmAnalyser.smoothingTimeConstant = 0;
+      srcNode.connect(tmAnalyser);
+    }
 
+    // ── YAMNet analyser: time domain (raw PCM), FFT 2048 ─────────────────
+    if (yamModel) {
+      yamAnalyser = audioCtx.createAnalyser();
+      yamAnalyser.fftSize               = 2048;
+      yamAnalyser.smoothingTimeConstant = 0;
+      srcNode.connect(yamAnalyser);
+
+      yamRing     = new Float32Array(nativeSR * 6); // 6 s ring buffer
+      yamRingHead = 0;
+      yamRingFull = false;
+    }
+
+    // Silent gain keeps the graph alive without playing mic audio to speakers
     silentGain = audioCtx.createGain();
-    silentGain.gain.value = 0; // don't echo mic to speakers
-
-    srcNode.connect(analyser);
-    analyser.connect(silentGain);
+    silentGain.gain.value = 0;
+    if (tmAnalyser)  tmAnalyser.connect(silentGain);
+    if (yamAnalyser) yamAnalyser.connect(silentGain);
     silentGain.connect(audioCtx.destination);
 
-    // Allocate ring buffer for 6 s of audio
-    ringBuffer = new Float32Array(nativeSR * 6);
-    ringHead   = 0;
-    ringFull   = false;
+    tmFrameBuf = [];
     lastHit    = {};
+    latestTmScores  = null;
+    latestYamScores = null;
     listening  = true;
 
-    captureTimer   = setInterval(captureFrame,  CAPTURE_MS);
-    inferenceTimer = setInterval(runInference,  POLL_MS);
+    // Start timers for each model
+    if (tmModel) {
+      tmFrameTimer = setInterval(collectTmFrame, TM_FRAME_MS);
+      tmInferTimer = setInterval(runTmInference, TM_INFER_MS);
+    }
+    if (yamModel) {
+      yamCapTimer   = setInterval(collectYamFrame,  YAM_CAPTURE_MS);
+      yamInferTimer = setInterval(runYamInference,  YAM_INFER_MS);
+    }
 
     startBtn.disabled = true;
     stopBtn.disabled  = false;
     statusEl.textContent = "Listening…";
     statusOrb.classList.add("listening");
-    addLog(`🎤 Mic active at ${nativeSR} Hz → resampling to ${YAMNET_SR} Hz for YAMNet.`);
+    addLog(`🎤 Mic active at ${nativeSR} Hz.`);
   } catch (e) {
     console.error("Audio setup error:", e);
     addLog("Audio system error: " + e.message);
@@ -485,18 +675,20 @@ async function startListening() {
 }
 
 function stopListening() {
-  clearInterval(captureTimer);
-  clearInterval(inferenceTimer);
-  captureTimer = inferenceTimer = null;
+  clearInterval(tmFrameTimer); clearInterval(tmInferTimer);
+  clearInterval(yamCapTimer);  clearInterval(yamInferTimer);
+  tmFrameTimer = tmInferTimer = yamCapTimer = yamInferTimer = null;
 
-  try { srcNode?.disconnect();    } catch {}
-  try { analyser?.disconnect();   } catch {}
-  try { silentGain?.disconnect(); } catch {}
+  try { srcNode?.disconnect();     } catch {}
+  try { tmAnalyser?.disconnect();  } catch {}
+  try { yamAnalyser?.disconnect(); } catch {}
+  try { silentGain?.disconnect();  } catch {}
   try { micStream?.getTracks().forEach(t => t.stop()); } catch {}
   try { if (audioCtx?.state !== "closed") audioCtx?.close(); } catch {}
 
-  srcNode = analyser = silentGain = micStream = audioCtx = null;
-  ringBuffer = null; ringHead = 0; ringFull = false;
+  srcNode = tmAnalyser = yamAnalyser = silentGain = micStream = audioCtx = null;
+  yamRing = null; yamRingHead = 0; yamRingFull = false;
+  tmFrameBuf = []; latestTmScores = null; latestYamScores = null;
   listening  = false;
 
   if (startBtn)  startBtn.disabled  = false;
